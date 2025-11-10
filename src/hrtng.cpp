@@ -150,6 +150,7 @@ ACT_DECL(mavx_disable            , AST_ENABLE_FOR(isMicroAvx_avail() &&  isMicro
 ACT_DECL(selection2block         , return (ctx->widget_type != BWN_PSEUDOCODE ? AST_DISABLE_FOR_WIDGET : (ctx->has_flag(ACF_HAS_SELECTION) ? AST_ENABLE : AST_DISABLE)))
 ACT_DECL(clear_if42blocks        , AST_ENABLE_FOR(has_if42blocks(vu->cfunc->entry_ea)))
 ACT_DECL(rename_func             , AST_ENABLE_FOR_PC)
+ACT_DECL(create_dynamic_struct             , AST_ENABLE_FOR_PC)
 #if IDA_SDK_VERSION < 750
 ACT_DECL(remove_rettype      , AST_ENABLE_FOR(vu->item.citype == VDI_FUNC))
 ACT_DECL(remove_argument     , AST_ENABLE_FOR(is_arg_var(vu)))
@@ -186,6 +187,7 @@ static const action_desc_t actions[] =
 	ACT_DESC("[hrt] Enable inlines",                 NULL, enable_inlines),
 	ACT_DESC("[hrt] Rename inline...",                "N", rename_inline),
 	ACT_DESC("[hrt] Rename func...",             "Ctrl-N", rename_func),
+	ACT_DESC("[hrt] Create dynamic struct...",             "Ctrl+T", create_dynamic_struct),
 	ACT_DESC("[hrt] Create 'inline' from grouped nodes",  NULL, create_inline_gr),
 	ACT_DESC("[hrt] Create 'inline' from selection",  NULL, create_inline_sel),
 	ACT_DESC("[hrt] Enable Unflattener",              NULL, uf_enable),
@@ -307,6 +309,7 @@ void add_hrt_popup_items(TWidget *view, TPopupMenu *p, vdui_t* vu)
 	if (has_if42blocks(vu->cfunc->entry_ea))
 		attach_action_to_popup(view, p, ACT_NAME(clear_if42blocks));
 	attach_action_to_popup(view, p, ACT_NAME(rename_func));
+	attach_action_to_popup(view, p, ACT_NAME(create_dynamic_struct));
 	attach_action_to_popup(view, p, ACT_NAME(refactoring));
 }
 
@@ -3038,6 +3041,171 @@ static int idaapi dummy_struct_cb(int field_id, form_actions_t &fa)
 		}
 	}
 	return 1;
+}
+
+ACT_DEF(create_dynamic_struct)
+{
+    vdui_t *vu = get_widget_vdui(ctx->widget);
+    if (!vu || !vu->cfunc)
+        return 0;
+
+    cfunc_t *cf = vu->cfunc;
+
+    qstring var_name;
+    if (!get_highlight(&var_name, ctx->widget, NULL))
+    {
+        warning("Select a variable or expression before creating the struct.");
+        return 0;
+    }
+
+    qstring struct_name;
+    struct_name.sprnt("struct_%s", var_name.c_str());
+    if (!ask_ident(&struct_name, "[hrt] Struct name like 'struct_'var1'':", struct_name.c_str()))
+        return 0;
+
+    if (!validate_name(&struct_name, VNT_IDENT, SN_CHECK))
+    {
+        Log(llError, "Name invalid for struct '%s'\n", struct_name.c_str());
+        return 0;
+    }
+
+    struct Access { ea_t ea; asize_t offset; asize_t size; };
+    qvector<Access> accesses;
+
+    struct visitor_t : public ctree_visitor_t
+    {
+        cfunc_t *cf;
+        qstring name;
+        qvector<Access> *acc;
+
+        visitor_t(cfunc_t *cf, const qstring &n, qvector<Access> *a)
+            : ctree_visitor_t(CV_FAST), cf(cf), name(n), acc(a) {}
+
+        int visit_expr(cexpr_t *e) override
+        {
+            if (!e) return 0;
+
+            // var->field
+            if (e->op == cot_memref && e->x && e->x->op == cot_var)
+            {
+                lvar_t *v = &cf->get_lvars()->at(e->x->v.idx); 
+                if (v && v->name == name)
+                {
+                    Access a{ e->ea, e->m, e->type.get_size() };
+                    acc->push_back(a);
+                }
+            }
+            // var[index]
+            else if (e->op == cot_idx && e->x && e->x->op == cot_var)
+            {
+                lvar_t *v = &cf->get_lvars()->at(e->x->v.idx); 
+                if (v && v->name == name)
+                {
+                    Access a{ e->ea, BADADDR, e->type.get_size() };
+                    acc->push_back(a);
+                }
+            }
+            return 0;
+        }
+    } vis(cf, var_name, &accesses);
+
+    vis.apply_to(&cf->body, nullptr);
+
+    if (accesses.empty())
+    {
+        Log(llWarning, "No access detected to the variable '%s'.\n", var_name.c_str());
+        return 0;
+    }
+
+    asize_t max_off = 0;
+    for (const auto &a : accesses)
+    {
+        if (a.offset != BADADDR)
+        {
+            asize_t end = a.offset + a.size;
+            if (end > max_off) max_off = end;
+        }
+    }
+    asize_t struct_size = max_off ? max_off : 8;
+
+    udt_type_data_t s;
+    s.taudt_bits |= TAUDT_UNALIGNED;
+    s.effalign = 1;
+    s.total_size = s.unpadded_size = struct_size;
+
+    for (int i = 0; i < accesses.size(); ++i)
+    {
+        const Access &a = accesses[i];
+        udm_t &m = s.push_back();
+
+        if (a.offset == BADADDR)
+            m.name.sprnt("field_idx_%d", i);
+        else
+            m.name.sprnt("field_%X", (uint32)a.offset);
+
+        m.offset = (a.offset == BADADDR ? i * 32 : a.offset) * 8; // bits
+        m.size   = a.size * 8;                                    // bits
+        create_type_from_size(&m.type, a.size);
+    }
+
+   
+    tinfo_t struct_tif;
+    if (!struct_tif.create_udt(s) ||
+        struct_tif.set_named_type(nullptr, struct_name.c_str()) != TERR_OK)
+    {
+        Log(llError, "Failed for create struct '%s'\n", struct_name.c_str());
+        return 0;
+    }
+
+    Log(llNotice, "Struct '%s' created with %d fields (%d bytes).\n",
+        struct_name.c_str(), accesses.size(), struct_size);
+
+    if (!vu || !vu->item.is_citem())
+        return 1;
+
+    cexpr_t *e = vu->item.e;
+    if (!e)
+        return 1;
+
+    qstring dummy;
+    tinfo_t target_type = struct_tif;
+
+    bool is_ptr = e->type.is_ptr();
+    if (!is_ptr && e->op == cot_var)
+    {
+        lvar_t *lv = &cf->get_lvars()->at(e->v.idx);
+        if (lv && lv->type().is_ptr())
+            is_ptr = true;
+    }
+
+    if (is_ptr)
+        target_type.create_ptr(struct_tif);
+
+    if (isRenameble(e->op) && !getExpName(cf, e, &dummy))
+    {
+        if (renameExp(e->ea, cf, e, &struct_name, vu, &target_type))
+        {
+            vu->refresh_view(true);
+            return 1;
+        }
+    }
+    if (e->op == cot_var)
+    {
+        lvar_t *lv = &cf->get_lvars()->at(e->v.idx); 
+        if (lv)
+        {
+            tinfo_t lvar_type = struct_tif;
+            if (lv->set_lvar_type(lvar_type))
+            {
+                vu->refresh_view(true);
+                Log(llNotice, "Type applied to: %s\n", lvar_type.dstr());
+                return 1;
+            }
+        }
+    }
+
+    Log(llWarning, "Struct created, but it was not possible to apply it automatically\n");
+    return 1;
 }
 
 ACT_DEF(create_dummy_struct)
